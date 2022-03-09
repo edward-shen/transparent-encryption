@@ -105,9 +105,7 @@ mod test {
             &mut self,
             buf: InOutBuf<'_, '_, u8>,
         ) -> Result<(), StreamCipherError> {
-            let buf = buf.into_out();
-
-            for c in buf {
+            for c in buf.into_out() {
                 *c ^= 0b10101010;
             }
 
@@ -118,13 +116,13 @@ mod test {
 
 #[cfg(test)]
 mod read {
+    use std::io::Read;
+
     use super::test::{BadCipher, TestResult};
     use super::EncryptedReader;
 
-    use std::io::Read;
-
     #[test]
-    fn read() -> TestResult<()> {
+    fn simple() -> TestResult<()> {
         let input = [0b10101010, 0b01010101];
         let mut reader = EncryptedReader::new(&input[..], BadCipher);
         let mut data = Vec::with_capacity(input.len());
