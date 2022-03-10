@@ -1,6 +1,6 @@
 # `transparent-encryption`
 
-_Name TDB_
+_Name TBD_
 
 Micro-crate providing reader and writer wrappers that transparently encrypt and
 decrypt data with stream ciphers.
