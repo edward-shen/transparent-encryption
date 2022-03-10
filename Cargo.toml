@@ -1,14 +1,22 @@
 [package]
 name = "transparent-encryption"
 version = "0.1.0"
-edition = "2018"
+authors = ["Edward Shen <hi@eddie.sh>"]
+edition = "2021"
+rust-version = "1.57" # Determined by cargo-msrv
+description = "Micro-crate for transparently applying stream ciphers to IO"
+repository = "https://www.github.com/edward-shen/transparent-encryption"
+license = "MIT OR Apache-2.0"
+keywords = ["async", "io", "stream", "ciphers"]
+categories = ["asynchronous", "cryptography"]
+include = ["src/**/*"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 cipher = "0.4"
-# chacha20 = "0.7"
 tokio = { version = "1", optional = true }
 
 [dev-dependencies]
+chacha20 = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "macros"] }
