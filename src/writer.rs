@@ -4,13 +4,12 @@ use cipher::generic_array::GenericArray;
 use cipher::{InnerIvInit, KeyInit, KeyIvInit, StreamCipher};
 
 #[cfg(feature = "tokio")]
-use core::marker::Unpin;
-#[cfg(feature = "tokio")]
-use core::pin::Pin;
-#[cfg(feature = "tokio")]
-use core::task::{Context, Poll};
-#[cfg(feature = "tokio")]
-use tokio::io::AsyncWrite;
+use {
+    core::marker::Unpin,
+    core::pin::Pin,
+    core::task::{Context, Poll},
+    tokio::io::AsyncWrite,
+};
 
 /// Writer that transparently applies a stream cipher to an underlying
 /// synchronous or asynchronous writer.
