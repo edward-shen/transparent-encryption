@@ -12,7 +12,7 @@ use {
 };
 
 /// Writer that transparently applies a stream cipher to an underlying
-/// synchronous or asynchronous writer.
+/// synchronous writer.
 ///
 /// Users should take caution and ensure or acknowledge if their selected stream
 /// cipher implementation can panic when applying its keystream to bytes. If the
@@ -31,7 +31,8 @@ use {
 ///
 /// Like all buffered [`Write`] implementors, it is not guaranteed that written
 /// bytes will be immediately available for reading. If this is needed, you
-/// should call [`Writer::flush`] before attempting any read calls.
+/// should call [`Writer::flush`] before attempting any read calls. [`Drop`] is
+/// implemented and will flush the buffer, but any errors are ignored.
 ///
 /// However, unlike other buffered [`Write`] implementors, this makes no attempt
 /// to coalesce multiple smaller write calls into one larger one. As a result,
@@ -40,15 +41,372 @@ use {
 ///
 /// [`Write`]: std::io::Write
 /// [`BufWriter`]: std::io::BufWriter
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct Writer<Inner, StreamCipher, const BUFFER_SIZE: usize> {
+#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Writer<Inner, Cipher, const BUFFER_SIZE: usize>
+where
+    Inner: Write,
+    Cipher: StreamCipher,
+{
+    writer_impl: WriterImpl<Inner, Cipher, BUFFER_SIZE>,
+}
+
+impl<Inner, Cipher, const BUFFER_SIZE: usize> Write for Writer<Inner, Cipher, BUFFER_SIZE>
+where
+    Inner: Write,
+    Cipher: StreamCipher,
+{
+    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+        self.writer_impl.write(buf)
+    }
+
+    fn flush(&mut self) -> IoResult<()> {
+        self.writer_impl.flush()
+    }
+}
+
+impl<Inner, Cipher, const BUFFER_SIZE: usize> Drop for Writer<Inner, Cipher, BUFFER_SIZE>
+where
+    Inner: Write,
+    Cipher: StreamCipher,
+{
+    fn drop(&mut self) {
+        std::mem::drop(self.writer_impl.flush());
+    }
+}
+
+impl<Inner, Cipher, const BUFFER_SIZE: usize> Writer<Inner, Cipher, BUFFER_SIZE>
+where
+    Inner: Write,
+    Cipher: StreamCipher,
+{
+    /// Constructs a new writer that applies the provided stream cipher to the
+    /// the provided input, before writing the encrypted data to the inner
+    /// writer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Write;
+    ///
+    /// use chacha20::ChaCha20;
+    /// use cipher::generic_array::GenericArray;
+    /// use cipher::KeyIvInit;
+    /// use transparent_encryption::BufWriter;
+    ///
+    /// let mut file = vec![];
+    /// let cipher = ChaCha20::new(&GenericArray::from([1; 32]), &GenericArray::from([1; 12]));
+    /// let mut writer = BufWriter::new(&mut file, cipher);
+    ///
+    /// writer.write_all(b"hello world")?;
+    /// writer.flush()?;
+    /// std::mem::drop(writer);
+    ///
+    /// assert_eq!(file, [0x73, 0x1a, 0x2b, 0xe6, 0x24, 0x7d, 0x51, 0x9b, 0xe9, 0x91, 0x38]);
+    ///
+    /// # std::io::Result::Ok(())
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This will panic if `BUFFER_SIZE` is zero.
+    pub fn new(writer: Inner, cipher: Cipher) -> Self {
+        assert!(BUFFER_SIZE > 0, "BUFFER_SIZE cannot be zero!");
+        Self {
+            writer_impl: WriterImpl::new(writer, cipher),
+        }
+    }
+}
+
+impl<Inner, Cipher, const BUFFER_SIZE: usize> Writer<Inner, Cipher, BUFFER_SIZE>
+where
+    Inner: Write,
+    Cipher: StreamCipher + KeyIvInit,
+{
+    /// Convenience constructor for ciphers that implement [`KeyIvInit`], such
+    /// as the [`ChaCha20`] family of stream ciphers.
+    ///
+    /// Constructs a new writer that applies the provided stream cipher to the
+    /// the provided input, before writing the encrypted data to the inner
+    /// writer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use chacha20::ChaCha20;
+    /// use cipher::generic_array::GenericArray;
+    /// use transparent_encryption::BufWriter;
+    ///
+    /// let mut file = vec![];
+    /// let writer: BufWriter<_, ChaCha20> = BufWriter::new_from_parts(
+    ///     &mut file,
+    ///     &GenericArray::from([1; 32]),
+    ///     &GenericArray::from([1; 12]),
+    /// );
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This will panic if `BUFFER_SIZE` is zero.
+    ///
+    /// [`KeyIvInit`]: cipher::KeyIvInit
+    /// [`ChaCha20`]: https://docs.rs/chacha20/
+    pub fn new_from_parts(
+        writer: Inner,
+        key: &GenericArray<u8, Cipher::KeySize>,
+        nonce: &GenericArray<u8, Cipher::IvSize>,
+    ) -> Self {
+        Self::new(writer, Cipher::new(key, nonce))
+    }
+}
+
+impl<Inner, Cipher, const BUFFER_SIZE: usize> Writer<Inner, Cipher, BUFFER_SIZE>
+where
+    Inner: Write,
+    Cipher: StreamCipher + KeyInit,
+{
+    /// Convenience constructor for ciphers that implement [`KeyInit`], such as
+    /// the [`Rabbit`] stream cipher.
+    ///
+    /// Constructs a new writer that constructs and applies the provided stream
+    /// cipher to the output of the inner writer.
+    ///
+    /// # Panics
+    ///
+    /// This will panic if `BUFFER_SIZE` is zero.
+    ///
+    /// [`KeyInit`]: cipher::KeyInit
+    /// [`Rabbit`]: https://docs.rs/rabbit/
+    pub fn new_from_key(writer: Inner, key: &GenericArray<u8, Cipher::KeySize>) -> Self {
+        Self::new(writer, Cipher::new(key))
+    }
+}
+
+impl<Inner, Cipher, const BUFFER_SIZE: usize> Writer<Inner, Cipher, BUFFER_SIZE>
+where
+    Inner: Write,
+    Cipher: StreamCipher + InnerIvInit,
+{
+    /// Convenience constructor for ciphers that implement [`InnerIvInit`]. This
+    /// generally shouldn't be implemented for stream ciphers.
+    ///
+    /// Constructs a new writer that constructs and applies the provided stream
+    /// cipher to the output of the inner writer.
+    ///
+    /// # Panics
+    ///
+    /// This will panic if `BUFFER_SIZE` is zero.
+    ///
+    /// [`InnerIvInit`]: cipher::InnerIvInit
+    pub fn new_from_inner_iv(
+        writer: Inner,
+        inner: Cipher::Inner,
+        iv: &GenericArray<u8, Cipher::IvSize>,
+    ) -> Self {
+        Self::new(writer, Cipher::inner_iv_init(inner, iv))
+    }
+}
+
+/// Writer that transparently applies a stream cipher to an underlying
+/// asynchronous writer.
+///
+/// Users should take caution and ensure or acknowledge if their selected stream
+/// cipher implementation can panic when applying its keystream to bytes. If the
+/// stream cipher implementation panics, then the write operation will result in
+/// a panic.
+///
+/// [`AsyncWriter`] must maintain an internal stack-allocated buffer to store
+/// already-encrypted data. The size is dependent on the user provided
+/// `BUFFER_SIZE`. Reasonable defaults will depend on your use case, but
+/// values such as `4096` or `8192` are pretty good starting points.
+///
+/// `BUFFER_SIZE` cannot be zero. This is a restriction of the [`AsyncWrite`]
+/// trait, as it only provides an immutable reference to the buffer of data to
+/// be written. As a result, we need a buffer to modify and encrypt the data
+/// before providing the encrypted bytes to the underlying writer.
+///
+/// [`AsyncWrite`]: tokio::io::AsyncWrite
+#[cfg(feature = "tokio")]
+#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct AsyncWriter<Inner, Cipher, const BUFFER_SIZE: usize>
+where
+    Inner: AsyncWrite,
+    Cipher: StreamCipher,
+{
+    writer_impl: WriterImpl<Inner, Cipher, BUFFER_SIZE>,
+}
+
+#[cfg(feature = "tokio")]
+impl<Inner, Cipher, const BUFFER_SIZE: usize> AsyncWrite for AsyncWriter<Inner, Cipher, BUFFER_SIZE>
+where
+    Inner: AsyncWrite + Unpin,
+    Cipher: StreamCipher + Unpin,
+{
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
+        self.inner_pinned_mut().poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        self.inner_pinned_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        self.inner_pinned_mut().poll_shutdown(cx)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<Inner, Cipher, const BUFFER_SIZE: usize> AsyncWriter<Inner, Cipher, BUFFER_SIZE>
+where
+    Inner: AsyncWrite,
+    Cipher: StreamCipher,
+{
+    /// Constructs a new writer that applies the provided stream cipher to the
+    /// the provided input, before writing the encrypted data to the inner
+    /// writer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use chacha20::ChaCha20;
+    /// use cipher::generic_array::GenericArray;
+    /// use cipher::KeyIvInit;
+    /// use transparent_encryption::AsyncBufWriter;
+    /// use tokio::io::{AsyncWrite, AsyncWriteExt};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> std::io::Result<()> {
+    /// let mut file = vec![];
+    /// let cipher = ChaCha20::new(&GenericArray::from([1; 32]), &GenericArray::from([1; 12]));
+    /// let mut writer = AsyncBufWriter::new(&mut file, cipher);
+    ///
+    /// writer.write_all(b"hello world").await?;
+    /// writer.flush().await?;
+    /// std::mem::drop(writer);
+    ///
+    /// assert_eq!(file, [0x73, 0x1a, 0x2b, 0xe6, 0x24, 0x7d, 0x51, 0x9b, 0xe9, 0x91, 0x38]);
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This will panic if `BUFFER_SIZE` is zero.
+    pub fn new(writer: Inner, cipher: Cipher) -> Self {
+        assert!(BUFFER_SIZE > 0, "BUFFER_SIZE cannot be zero!");
+        Self {
+            writer_impl: WriterImpl::new(writer, cipher),
+        }
+    }
+
+    fn inner_pinned_mut(self: Pin<&mut Self>) -> Pin<&mut WriterImpl<Inner, Cipher, BUFFER_SIZE>> {
+        unsafe { self.map_unchecked_mut(|me| &mut me.writer_impl) }
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<Inner, Cipher, const BUFFER_SIZE: usize> AsyncWriter<Inner, Cipher, BUFFER_SIZE>
+where
+    Inner: AsyncWrite,
+    Cipher: StreamCipher + KeyIvInit,
+{
+    /// Convenience constructor for ciphers that implement [`KeyIvInit`], such
+    /// as the [`ChaCha20`] family of stream ciphers.
+    ///
+    /// Constructs a new writer that applies the provided stream cipher to the
+    /// the provided input, before writing the encrypted data to the inner
+    /// writer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use chacha20::ChaCha20;
+    /// use cipher::generic_array::GenericArray;
+    /// use transparent_encryption::AsyncBufWriter;
+    ///
+    /// let mut file = vec![];
+    /// let writer: AsyncBufWriter<_, ChaCha20> = AsyncBufWriter::new_from_parts(
+    ///     &mut file,
+    ///     &GenericArray::from([1; 32]),
+    ///     &GenericArray::from([1; 12]),
+    /// );
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This will panic if `BUFFER_SIZE` is zero.
+    ///
+    /// [`KeyIvInit`]: cipher::KeyIvInit
+    /// [`ChaCha20`]: https://docs.rs/chacha20/
+    pub fn new_from_parts(
+        writer: Inner,
+        key: &GenericArray<u8, Cipher::KeySize>,
+        nonce: &GenericArray<u8, Cipher::IvSize>,
+    ) -> Self {
+        Self::new(writer, Cipher::new(key, nonce))
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<Inner, Cipher, const BUFFER_SIZE: usize> AsyncWriter<Inner, Cipher, BUFFER_SIZE>
+where
+    Inner: AsyncWrite,
+    Cipher: StreamCipher + KeyInit,
+{
+    /// Convenience constructor for ciphers that implement [`KeyInit`], such as
+    /// the [`Rabbit`] stream cipher.
+    ///
+    /// Constructs a new writer that constructs and applies the provided stream
+    /// cipher to the output of the inner writer.
+    ///
+    /// # Panics
+    ///
+    /// This will panic if `BUFFER_SIZE` is zero.
+    ///
+    /// [`KeyInit`]: cipher::KeyInit
+    /// [`Rabbit`]: https://docs.rs/rabbit/
+    pub fn new_from_key(writer: Inner, key: &GenericArray<u8, Cipher::KeySize>) -> Self {
+        Self::new(writer, Cipher::new(key))
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<Inner, Cipher, const BUFFER_SIZE: usize> AsyncWriter<Inner, Cipher, BUFFER_SIZE>
+where
+    Inner: AsyncWrite,
+    Cipher: StreamCipher + InnerIvInit,
+{
+    /// Convenience constructor for ciphers that implement [`InnerIvInit`]. This
+    /// generally shouldn't be implemented for stream ciphers.
+    ///
+    /// Constructs a new writer that constructs and applies the provided stream
+    /// cipher to the output of the inner writer.
+    ///
+    /// # Panics
+    ///
+    /// This will panic if `BUFFER_SIZE` is zero.
+    ///
+    /// [`InnerIvInit`]: cipher::InnerIvInit
+    pub fn new_from_inner_iv(
+        writer: Inner,
+        inner: Cipher::Inner,
+        iv: &GenericArray<u8, Cipher::IvSize>,
+    ) -> Self {
+        Self::new(writer, Cipher::inner_iv_init(inner, iv))
+    }
+}
+
+/// Generic writer implementation for both synchronous and asynchronous
+/// implementations.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+struct WriterImpl<Inner, StreamCipher, const BUFFER_SIZE: usize> {
     writer: Inner,
     cipher: StreamCipher,
     buffer: [u8; BUFFER_SIZE],
     buffer_end: usize,
 }
 
-impl<Inner, Cipher, const BUFFER_SIZE: usize> Default for Writer<Inner, Cipher, BUFFER_SIZE>
+impl<Inner, Cipher, const BUFFER_SIZE: usize> Default for WriterImpl<Inner, Cipher, BUFFER_SIZE>
 where
     Inner: Default,
     Cipher: Default,
@@ -63,7 +421,7 @@ where
     }
 }
 
-impl<Inner, Cipher, const BUFFER_SIZE: usize> Writer<Inner, Cipher, BUFFER_SIZE>
+impl<Inner, Cipher, const BUFFER_SIZE: usize> WriterImpl<Inner, Cipher, BUFFER_SIZE>
 where
     Cipher: StreamCipher,
 {
@@ -100,37 +458,8 @@ where
     }
 }
 
-impl<Inner, Cipher, const BUFFER_SIZE: usize> Writer<Inner, Cipher, BUFFER_SIZE> {
-    /// Constructs a new writer that applies the provided stream cipher to the
-    /// the provided input, before writing the encrypted data to the inner
-    /// writer.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::io::Write;
-    ///
-    /// use chacha20::ChaCha20;
-    /// use cipher::generic_array::GenericArray;
-    /// use cipher::KeyIvInit;
-    /// use transparent_encryption::Writer;
-    ///
-    /// let mut file = vec![];
-    /// let cipher = ChaCha20::new(&GenericArray::from([1; 32]), &GenericArray::from([1; 12]));
-    /// let mut writer: Writer<_, _, 4096> = Writer::new(&mut file, cipher);
-    ///
-    /// writer.write_all(b"hello world")?;
-    /// writer.flush()?;
-    ///
-    /// assert_eq!(file, [0x73, 0x1a, 0x2b, 0xe6, 0x24, 0x7d, 0x51, 0x9b, 0xe9, 0x91, 0x38]);
-    ///
-    /// # std::io::Result::Ok(())
-    /// ```
-    ///
-    /// # Panics
-    ///
-    /// This will panic if `BUFFER_SIZE` is zero.
-    pub const fn new(writer: Inner, cipher: Cipher) -> Self {
+impl<Inner, Cipher, const BUFFER_SIZE: usize> WriterImpl<Inner, Cipher, BUFFER_SIZE> {
+    fn new(writer: Inner, cipher: Cipher) -> Self {
         assert!(BUFFER_SIZE > 0, "BUFFER_SIZE cannot be zero!");
         Self {
             writer,
@@ -141,93 +470,7 @@ impl<Inner, Cipher, const BUFFER_SIZE: usize> Writer<Inner, Cipher, BUFFER_SIZE>
     }
 }
 
-impl<Inner, Cipher, const BUFFER_SIZE: usize> Writer<Inner, Cipher, BUFFER_SIZE>
-where
-    Cipher: KeyIvInit,
-{
-    /// Convenience constructor for ciphers that implement [`KeyIvInit`], such
-    /// as the [`ChaCha20`] family of stream ciphers.
-    ///
-    /// Constructs a new writer that applies the provided stream cipher to the
-    /// the provided input, before writing the encrypted data to the inner
-    /// writer.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use chacha20::ChaCha20;
-    /// use cipher::generic_array::GenericArray;
-    /// use transparent_encryption::Writer;
-    ///
-    /// let mut file = vec![];
-    /// let writer: Writer<_, _, 4096> = Writer::new_from_parts(
-    ///     &mut file,
-    ///     &GenericArray::from([1; 32]),
-    ///     &GenericArray::from([1; 12]),
-    /// );
-    /// ```
-    ///
-    /// # Panics
-    ///
-    /// This will panic if `BUFFER_SIZE` is zero.
-    ///
-    /// [`KeyIvInit`]: cipher::KeyIvInit
-    /// [`ChaCha20`]: https://docs.rs/chacha20/
-    pub fn new_from_parts(
-        writer: Inner,
-        key: &GenericArray<u8, Cipher::KeySize>,
-        nonce: &GenericArray<u8, Cipher::IvSize>,
-    ) -> Self {
-        Self::new(writer, Cipher::new(key, nonce))
-    }
-}
-
-impl<Inner, Cipher, const BUFFER_SIZE: usize> Writer<Inner, Cipher, BUFFER_SIZE>
-where
-    Cipher: KeyInit,
-{
-    /// Convenience constructor for ciphers that implement [`KeyInit`], such as
-    /// the [`Rabbit`] stream cipher.
-    ///
-    /// Constructs a new writer that constructs and applies the provided stream
-    /// cipher to the output of the inner writer.
-    ///
-    /// # Panics
-    ///
-    /// This will panic if `BUFFER_SIZE` is zero.
-    ///
-    /// [`KeyInit`]: cipher::KeyInit
-    /// [`Rabbit`]: https://docs.rs/rabbit/
-    pub fn new_from_key(writer: Inner, key: &GenericArray<u8, Cipher::KeySize>) -> Self {
-        Self::new(writer, Cipher::new(key))
-    }
-}
-
-impl<Inner, Cipher, const BUFFER_SIZE: usize> Writer<Inner, Cipher, BUFFER_SIZE>
-where
-    Cipher: InnerIvInit,
-{
-    /// Convenience constructor for ciphers that implement [`InnerIvInit`]. This
-    /// generally shouldn't be implemented for stream ciphers.
-    ///
-    /// Constructs a new writer that constructs and applies the provided stream
-    /// cipher to the output of the inner writer.
-    ///
-    /// # Panics
-    ///
-    /// This will panic if `BUFFER_SIZE` is zero.
-    ///
-    /// [`InnerIvInit`]: cipher::InnerIvInit
-    pub fn new_from_inner_iv(
-        writer: Inner,
-        inner: Cipher::Inner,
-        iv: &GenericArray<u8, Cipher::IvSize>,
-    ) -> Self {
-        Self::new(writer, Cipher::inner_iv_init(inner, iv))
-    }
-}
-
-impl<Inner, Cipher, const BUFFER_SIZE: usize> Write for Writer<Inner, Cipher, BUFFER_SIZE>
+impl<Inner, Cipher, const BUFFER_SIZE: usize> Write for WriterImpl<Inner, Cipher, BUFFER_SIZE>
 where
     Inner: Write,
     Cipher: StreamCipher,
@@ -246,12 +489,14 @@ where
                 .write(&self.buffer[bytes_written..self.buffer_end])?;
         }
 
+        self.buffer_end = 0;
+
         self.writer.flush()
     }
 }
 
 #[cfg(feature = "tokio")]
-impl<Inner, Cipher, const BUFFER_SIZE: usize> AsyncWrite for Writer<Inner, Cipher, BUFFER_SIZE>
+impl<Inner, Cipher, const BUFFER_SIZE: usize> AsyncWrite for WriterImpl<Inner, Cipher, BUFFER_SIZE>
 where
     Inner: AsyncWrite + Unpin,
     Cipher: StreamCipher + Unpin,
@@ -385,21 +630,24 @@ mod write {
     #[test]
     fn simple_large_buffer() -> TestResult<()> {
         let mut underlying = vec![];
-        let mut writer = Writer::<_, _, 2048>::new(&mut underlying, IncrementalCipher::default());
         let data: Vec<u8> = (0..100).collect();
-        writer.write_all(&data)?;
-        writer.flush()?;
+        {
+            let mut writer =
+                Writer::<_, _, 2048>::new(&mut underlying, IncrementalCipher::default());
+            writer.write_all(&data)?;
+        }
         assert_eq!(underlying, [0].repeat(data.len()));
         Ok(())
     }
 
     #[test]
     fn simple_small_buffer() -> TestResult<()> {
-        let mut underlying = vec![];
-        let mut writer = Writer::<_, _, 64>::new(&mut underlying, IncrementalCipher::default());
         let data: Vec<u8> = (0..100).collect();
-        writer.write_all(&data)?;
-        writer.flush()?;
+        let mut underlying = vec![];
+        {
+            let mut writer = Writer::<_, _, 64>::new(&mut underlying, IncrementalCipher::default());
+            writer.write_all(&data)?;
+        }
         assert_eq!(underlying, [0].repeat(data.len()));
         Ok(())
     }
@@ -407,10 +655,12 @@ mod write {
     #[test]
     fn slow_writer() -> TestResult<()> {
         let mut underlying = ThreeByteWriter(vec![]);
-        let mut writer = Writer::<_, _, 2048>::new(&mut underlying, IncrementalCipher::default());
         let data: Vec<u8> = (0..100).collect();
-        writer.write_all(&data)?;
-        writer.flush()?;
+        {
+            let mut writer =
+                Writer::<_, _, 2048>::new(&mut underlying, IncrementalCipher::default());
+            writer.write_all(&data)?;
+        }
         assert_eq!(underlying.0, [0].repeat(data.len()));
         Ok(())
     }
@@ -419,14 +669,15 @@ mod write {
 #[cfg(all(test, feature = "tokio"))]
 mod tokio_async_write {
     use super::test::*;
-    use super::Writer;
+    use super::AsyncWriter;
 
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn simple_large_buffer() -> TestResult<()> {
         let mut underlying = vec![];
-        let mut writer = Writer::<_, _, 2048>::new(&mut underlying, IncrementalCipher::default());
+        let mut writer =
+            AsyncWriter::<_, _, 2048>::new(&mut underlying, IncrementalCipher::default());
         let data: Vec<u8> = (0..100).collect();
         AsyncWriteExt::write_all(&mut writer, &data).await?;
         writer.flush().await?;
@@ -437,7 +688,8 @@ mod tokio_async_write {
     #[tokio::test]
     async fn simple_small_buffer() -> TestResult<()> {
         let mut underlying = vec![];
-        let mut writer = Writer::<_, _, 64>::new(&mut underlying, IncrementalCipher::default());
+        let mut writer =
+            AsyncWriter::<_, _, 64>::new(&mut underlying, IncrementalCipher::default());
         let data: Vec<u8> = (0..100).collect();
         AsyncWriteExt::write_all(&mut writer, &data).await?;
         writer.flush().await?;
@@ -448,7 +700,8 @@ mod tokio_async_write {
     #[tokio::test]
     async fn slow_writer() -> TestResult<()> {
         let mut underlying = ThreeByteWriter(vec![]);
-        let mut writer = Writer::<_, _, 2048>::new(&mut underlying, IncrementalCipher::default());
+        let mut writer =
+            AsyncWriter::<_, _, 2048>::new(&mut underlying, IncrementalCipher::default());
         let data: Vec<u8> = (0..100).collect();
         AsyncWriteExt::write_all(&mut writer, &data).await?;
         writer.flush().await?;
