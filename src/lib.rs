@@ -34,5 +34,9 @@
 
 mod reader;
 mod writer;
+
 pub use reader::Reader;
 pub use writer::Writer;
+
+/// Convenience alias for a writer with a reasonable buffer.
+pub type BufWriter<Inner, Cipher> = writer::Writer<Inner, Cipher, 4096>;
