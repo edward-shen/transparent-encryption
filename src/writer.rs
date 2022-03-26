@@ -227,6 +227,7 @@ where
 /// [`AsyncWrite`]: tokio::io::AsyncWrite
 #[cfg(feature = "tokio")]
 #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[allow(clippy::module_name_repetitions)]
 pub struct AsyncWriter<Inner, Cipher, const BUFFER_SIZE: usize>
 where
     Inner: AsyncWrite,
